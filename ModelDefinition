@@ -1,0 +1,189 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+# --- Utility functions ---
+def create_synthetic_video(image, num_frames=16):
+    """
+    Creates a synthetic video from a single image by stacking slightly modified versions.
+
+    Args:
+        image: A tensor of shape (B, C, H, W).
+        num_frames: The number of frames in the synthetic video.
+
+    Returns:
+        A tensor of shape (B, T, C, H, W).
+    """
+    B, C, H, W = image.shape
+    video = torch.zeros((B, num_frames, C, H, W), device=image.device)
+    for t in range(num_frames):
+        # Add slight noise to each frame
+        noise = torch.randn_like(image) * 0.01 * t  # Scale noise with frame index
+        video[:, t] = torch.clamp(image + noise, 0, 1) #Clamp between 0 and 1
+    return video
+
+# 1.  Parametric Dynamic Tanh Normalization Layer
+class DynamicTanh(nn.Module):  #Base Class
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+      raise NotImplementedError("Subclasses must implement the forward method.")
+
+# 1.1 Constant Parametric Dynamic Tanh
+class ConstantParamTanh(DynamicTanh):
+    def __init__(self, height, width, alpha=1.0, mode = "Single"): #Add the height and width, mandatory now
+        super().__init__()
+        self.height = height
+        self.width = width
+        self.mode = mode
+        if(mode == "Single"):
+          self.alpha = nn.Parameter(torch.tensor(alpha))  #trainable constant, default 1
+        elif(mode == "Matrix"):
+          self.alpha = nn.Parameter(torch.ones(1, 1, height, width) * alpha)  #Trainable constant, default 1
+          nn.init.xavier_uniform_(self.alpha)
+        else:
+          self.frame_rate = 188.5 #Default value
+          self.omega = 2 * math.pi * self.frame_rate
+    def forward(self, x, t = None):
+        if(self.mode == "Single"):
+          return torch.tanh(self.alpha * x)
+        elif(self.mode == "Matrix"):
+          return torch.tanh(self.alpha * x)
+        else:
+          # Create the matrix of functions
+          B = x.shape[0]
+          alpha = torch.zeros((B, 1, self.height, self.width), device=x.device)
+          for i in range(self.height):
+              for j in range(self.width):
+                  alpha[:, :, i, j] = torch.cos(self.omega * t + (i * self.width + j) * math.pi / 2)
+          return torch.tanh(alpha * x)
+
+class VAE(nn.Module):
+    def __init__(self):
+        super(VAE, self).__init__()
+
+        # Encoder
+        self.enc1 = nn.Conv2d(3, 48, kernel_size=3, padding="same") #Explicit padding with "same" will adapt the input dimension
+        self.enc2 = nn.Conv2d(48, 48, kernel_size=3, padding="same")
+        self.enc3 = nn.Conv2d(48, 48, kernel_size=3, padding="same")
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)#For asymmetric stride
+        #Latent space parameterization layers
+        self.fc1 = nn.Linear(48 * 16 * 16, 64)  #  mean
+        self.fc2 = nn.Linear(48 * 16 * 16, 64)  #  log variance
+        self.fc3 = nn.Linear(64, 48 * 16 * 16) # from latent space to decoder
+
+        # Decoder
+        self.dec1 = nn.ConvTranspose2d(48, 48, kernel_size=3, padding="same")
+        self.dec2 = nn.ConvTranspose2d(48, 48, kernel_size=3, padding="same")
+        self.dec3 = nn.ConvTranspose2d(48, 3, kernel_size=3, padding="same")
+
+
+    def encoder(self, x):
+        x = F.relu(self.enc1(x))
+        x = self.pool(x)
+        x = F.relu(self.enc2(x))
+        x = self.pool(x)
+        x = F.relu(self.enc3(x))
+        x = self.pool(x)
+        x = torch.flatten(x, start_dim=1)
+        return x
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5*logvar)
+        eps = torch.randn_like(std)
+        return mu + eps*std
+
+    def decoder(self, x):
+        x = F.relu(self.dec1(x))
+        x = F.relu(self.dec2(x))
+        x = torch.sigmoid(self.dec3(x)) #Sigmoid, so all the outputs are compressed from 0 to 1
+        return x
+
+    def forward(self, x, tanh_layer = None, t = None):
+        #Encode
+        x_encoded = self.encoder(x)
+        #Latent space parameterization
+        mu = F.relu(self.fc1(x_encoded))
+        log_var = F.relu(self.fc2(x_encoded))
+        #Sampling
+        z = self.reparameterize(mu, log_var)
+        #Mapping to the Decoder
+        x_reconstructed = F.relu(self.fc3(z))
+        x_reconstructed = x_reconstructed.reshape(-1, 48, 16, 16) # From linear to image
+        #Decode
+        x_reconstructed = self.decoder(x_reconstructed)
+        #Dynamic Tanh
+        if tanh_layer is not None:
+          x_reconstructed = tanh_layer(x_reconstructed, t)
+        return x_reconstructed, mu, log_var #Return also mu and log_var for the loss function calculation
+
+class Discriminator(nn.Module):
+    def __init__(self):
+        super(Discriminator, self).__init__()
+
+        # Encoder
+        self.enc1 = nn.Conv2d(3, 48, kernel_size=3, padding="same") #Explicit padding with "same" will adapt the input dimension
+        self.enc2 = nn.Conv2d(48, 48, kernel_size=3, padding="same")
+        self.enc3 = nn.Conv2d(48, 48, kernel_size=3, padding="same")
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)#For asymmetric stride
+        #Latent space parameterization layers
+        self.fc1 = nn.Linear(48 * 16 * 16, 64)  #  mean
+        self.fc2 = nn.Linear(48 * 16 * 16, 64)  #  log variance
+        self.fc3 = nn.Linear(64, 1) # from latent space to decoder
+
+    def forward(self, x):
+        x = F.relu(self.enc1(x))
+        x = self.pool(x)
+        x = F.relu(self.enc2(x))
+        x = self.pool(x)
+        x = F.relu(self.enc3(x))
+        x = self.pool(x)
+        x = torch.flatten(x, 1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = torch.sigmoid(self.fc3(x)) # From linear to image
+        return x
+
+# --- Loss Functions ---
+
+def wasserstein_loss(real_samples, generated_samples, discriminator):
+    # Calculate discriminator output for real and generated samples
+    real_validity = discriminator(real_samples)
+    fake_validity = discriminator(generated_samples)
+
+    # Calculate Wasserstein loss
+    wasserstein_distance = torch.mean(real_validity) - torch.mean(fake_validity)
+    return wasserstein_distance
+
+def gradient_penalty(real_samples, generated_samples, discriminator, device="cpu"):
+    """Calculates the gradient penalty loss for WGAN-GP"""
+    # Random weight term for interpolation between real and fake samples
+    alpha = torch.randn((real_samples.size(0), 1, 1, 1), device = device)
+    # Get random interpolation between real and fake samples
+    interpolated = (alpha * real_samples + ((1 - alpha) * generated_samples)).requires_grad_(True)
+    interpolated.to(device)
+    interpolated_output = discriminator(interpolated)
+
+    grad_outputs = torch.ones(interpolated_output.size(), dtype=torch.float, device=device, requires_grad=False)
+
+    # Get gradient of output w.r.t. interpolated input
+    grad_interpolated = torch.autograd.grad(
+        outputs=interpolated_output,
+        inputs=interpolated,
+        grad_outputs=grad_outputs,
+        create_graph=True,
+        retain_graph=True,
+    )[0]
+
+    grad_interpolated = grad_interpolated.view(real_samples.size(0), -1)
+    grad_norm = grad_interpolated.norm(2, dim=1)
+    grad_penalty = torch.mean((grad_norm - 1) ** 2)
+    return grad_penalty
+
+#Combined Loss = Wasserstein loss + gradient_penalty
+def combined_loss(real_samples, generated_samples, discriminator, device, lambda_gp = 10):
+    wasserstein = wasserstein_loss(real_samples, generated_samples, discriminator)
+    grad_pen = gradient_penalty(real_samples, generated_samples, discriminator, device)
+    return wasserstein + lambda_gp * grad_pen
